@@ -19,6 +19,10 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// The startup catch-up only re-syncs chats active within this many days, so it
+/// polls a few hundred chats at most instead of every chat (avoids FLOOD_WAIT).
+const STARTUP_CATCHUP_DAYS: i64 = 30;
+
 #[derive(Args, Debug, Clone)]
 pub struct DaemonArgs {
     /// Don't run background sync (only listen for new updates)
@@ -44,6 +48,11 @@ pub struct DaemonArgs {
     /// Output updates as JSONL stream to stdout
     #[arg(long, default_value_t = false)]
     pub stream: bool,
+
+    /// Skip the one-shot incremental catch-up sync that runs at startup
+    /// (which recovers messages missed while the daemon was down).
+    #[arg(long, default_value_t = false)]
+    pub no_startup_catchup: bool,
 }
 
 /// Extract chat_id from a Peer
@@ -139,6 +148,57 @@ fn access_hash_from_peer(peer: &Peer) -> Option<i64> {
 pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     let mut app = App::new(cli).await?;
 
+    // Catch up on messages missed while the daemon was down. Runs once, here,
+    // sequentially *before* the live update stream starts — so it never
+    // contends with the live writer for the DB lock (unlike the old concurrent
+    // background backfill). This fires on exactly the events that open a gap:
+    // reboot, crash, or a hard reconnect that restarts the process.
+    if !args.no_startup_catchup {
+        if !args.quiet {
+            eprintln!("Startup catch-up sync...");
+        }
+        let opts = crate::app::sync::SyncOptions {
+            output: crate::app::sync::OutputMode::None,
+            mark_read: false,
+            download_media: false,
+            ignore_chat_ids: args.ignore_chat_ids.clone(),
+            ignore_channels: args.ignore_channels,
+            show_progress: false,
+            incremental: true,
+            messages_per_chat: 50,
+            concurrency: 4,
+            chat_filter: None,
+            prune_after: None,
+            skip_archived: false,
+            archived_only: false,
+            // Only re-sync recently-active chats — polling every chat triggers
+            // FLOOD_WAIT and is wasteful (a gap matters for active chats).
+            active_since: Some(Utc::now() - chrono::Duration::days(STARTUP_CATCHUP_DAYS)),
+        };
+        match app.sync_msgs(opts).await {
+            Ok(res) => {
+                log::info!(
+                    "startup catch-up: {} msgs / {} chats",
+                    res.messages_stored,
+                    res.chats_stored
+                );
+                if !args.quiet {
+                    eprintln!(
+                        "Startup catch-up complete: {} new messages across {} chats",
+                        res.messages_stored, res.chats_stored
+                    );
+                }
+            }
+            Err(e) => {
+                // Never fatal — fall through to live listening regardless.
+                log::warn!("startup catch-up failed (continuing to live listen): {}", e);
+                if !args.quiet {
+                    eprintln!("Startup catch-up failed (continuing): {}", e);
+                }
+            }
+        }
+    }
+
     // Take ownership of the updates receiver
     let updates_rx = app
         .updates_rx
@@ -218,6 +278,7 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
                 prune_after: None,
                 skip_archived: false,
                 archived_only: false,
+                active_since: None,
             };
 
             let result = backfill_app.sync(opts).await;

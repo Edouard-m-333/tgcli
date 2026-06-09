@@ -118,6 +118,7 @@ fn build_sync_options(common: &CommonSyncArgs) -> crate::app::sync::SyncOptions 
         prune_after: common.prune_after,
         skip_archived: common.skip_archived,
         archived_only: common.archived_only,
+        active_since: None,
     }
 }
 

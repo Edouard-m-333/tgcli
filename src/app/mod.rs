@@ -29,12 +29,15 @@ impl App {
         let store_dir = cli.store_dir();
         std::fs::create_dir_all(&store_dir)
             .with_context(|| format!("Failed to create store directory '{}'", store_dir))?;
+        crate::fsperm::harden_dir(&store_dir);
 
         let session_path = format!("{}/session.db", store_dir);
         // SqliteSession::open creates the file if it doesn't exist
 
         let (tg, updates_rx) = TgClient::connect_with_updates(&session_path)
             .context("Failed to connect to Telegram")?;
+        // The session holds the raw auth key — never leave it world-readable.
+        crate::fsperm::harden_file(&session_path);
 
         if !tg
             .client
@@ -58,11 +61,14 @@ impl App {
         let store_dir = cli.store_dir();
         std::fs::create_dir_all(&store_dir)
             .with_context(|| format!("Failed to create store directory '{}'", store_dir))?;
+        crate::fsperm::harden_dir(&store_dir);
 
         let session_path = format!("{}/session.db", store_dir);
 
         let (tg, updates_rx) = TgClient::connect_with_updates(&session_path)
             .context("Failed to connect to Telegram")?;
+        // The session holds the raw auth key — never leave it world-readable.
+        crate::fsperm::harden_file(&session_path);
         Ok(App {
             tg,
             store_dir,

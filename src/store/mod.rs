@@ -102,6 +102,7 @@ pub struct UpsertMessageParams {
 impl Store {
     pub async fn open(store_dir: &str) -> Result<Self> {
         std::fs::create_dir_all(store_dir)?;
+        crate::fsperm::harden_dir(store_dir);
         let db_path = Path::new(store_dir).join("tgcli.db");
         let db_path_str = db_path.to_string_lossy();
         let db: Database = Builder::new_local(&db_path_str)
@@ -117,6 +118,13 @@ impl Store {
         let _ = conn.query("PRAGMA busy_timeout=5000", ()).await;
         let _ = conn.query("PRAGMA synchronous=NORMAL", ()).await;
         let _ = conn.query("PRAGMA cache_size=-64000", ()).await;
+
+        // The database (all messages + contact phone numbers) and its WAL
+        // sidecars must not be world-readable. WAL mode creates the sidecars on
+        // first write above, so harden them here too.
+        crate::fsperm::harden_file(&db_path);
+        crate::fsperm::harden_file(db_path.with_extension("db-wal"));
+        crate::fsperm::harden_file(db_path.with_extension("db-shm"));
 
         let mut store = Store { db, has_fts: false };
         store.migrate(&conn).await?;

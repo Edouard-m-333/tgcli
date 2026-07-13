@@ -1,6 +1,7 @@
 mod app;
 mod cmd;
 mod error;
+mod fsperm;
 mod out;
 mod shutdown;
 mod store;

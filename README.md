@@ -2,25 +2,43 @@
 
 Telegram CLI tool in **pure Rust** using [grammers](https://github.com/Lonami/grammers) (MTProto). No TDLib, no C/C++ dependencies. `cargo build` and done.
 
+> **Fork notice** — this is a fork of [dgrr/tgcli](https://github.com/dgrr/tgcli) with extra features on top of upstream. See [What's in this fork](#whats-in-this-fork).
+
+## What's in this fork
+
+Features added on top of upstream `dgrr/tgcli`:
+
+- **Full-history backfill** — `messages fetch --all` walks a chat back to its very first message (Ctrl-C safe, resumes where it left off). Supports `--download-media` and repeatable `--chat` to backfill several chats in one run. See [Backfill](#backfill-full-history).
+- **Contacts auto-populated from message senders** — every message processed by `sync`, the daemon, or `chats members` upserts its sender into the local contacts table. Group members outside your address book get real names instead of `user:<id>`, at no extra API cost.
+- **Daemon startup catch-up** — on (re)start the daemon runs one incremental sync of chats active in the last 30 days before entering the live loop, recovering messages missed while it was down. Opt out with `--no-startup-catchup`.
+
 ## Quick Install
 
-### Homebrew (macOS/Linux)
+Requires [Rust](https://rustup.rs/) (`cargo`). Prebuilt binaries (Homebrew, install script) are only published by upstream and **do not include the fork features** — build this fork from source.
+
+### Install directly with cargo (recommended for a new device)
+
+```bash
+cargo install --git https://github.com/Edouard-m-333/tgcli --locked
+```
+
+This builds and places `tgcli` in `~/.cargo/bin/` (make sure it is on your `PATH`).
+
+### Clone and build
+
+```bash
+git clone https://github.com/Edouard-m-333/tgcli.git
+cd tgcli
+cargo build --release
+cp target/release/tgcli /usr/local/bin/
+```
+
+### Upstream version (without fork features)
 
 ```bash
 brew install dgrr/tgcli/tgcli
-```
-
-### Shell Script
-
-```bash
+# or
 curl -fsSL https://raw.githubusercontent.com/dgrr/tgcli/main/install.sh | bash
-```
-
-### Build from Source
-
-```bash
-cargo build --release
-cp target/release/tgcli /usr/local/bin/
 ```
 
 ## Features
@@ -29,7 +47,8 @@ cp target/release/tgcli /usr/local/bin/
 - **Sync**: Incremental sync with checkpoints, stored in libSQL (turso) with FTS5
 - **Chats**: List, search, create, join/leave, archive, pin, mute
 - **Messages**: List, search (FTS5 + global API), send, edit, delete, forward, download
-- **Contacts**: List and search from local DB
+- **Backfill**: Fetch older history per chat — up to the full history with `--all`, media included with `--download-media` *(fork)*
+- **Contacts**: List and search from local DB — auto-populated from message senders *(fork)*
 - **Admin**: Ban, kick, promote, demote group members
 - **Read**: Mark messages as read
 - **Stickers**: List, search, send stickers
@@ -86,6 +105,36 @@ tgcli sync --no-progress
 tgcli sync --stream
 ```
 
+## Backfill (Full History)
+
+`sync` only moves forward from its checkpoint. To fetch **older** messages, use `messages fetch` — it walks backward from the oldest message already stored, so re-running always resumes where the last run stopped.
+
+```bash
+# Fetch the next 100 older messages of a chat (default)
+tgcli messages fetch --chat 987654321
+
+# Fetch a specific amount
+tgcli messages fetch --chat 987654321 --limit 1000
+
+# Fetch the ENTIRE history of a chat (walks back to the first message)
+tgcli messages fetch --chat 987654321 --all
+
+# Download media while backfilling (same as sync --download-media)
+tgcli messages fetch --chat 987654321 --all --download-media
+
+# Backfill several chats in one run (--chat is repeatable)
+tgcli messages fetch --chat 111 --chat 222 --chat 333 --all
+
+# Forum groups: restrict to a topic
+tgcli messages fetch --chat 987654321 --topic 42
+```
+
+Notes:
+
+- `--all` ignores `--limit` and keeps going until the start of the chat.
+- Every message is stored immediately, so **Ctrl-C is safe** — a long walk can be interrupted and resumed later with the same command.
+- Very large chats can hit Telegram rate limits (FLOOD_WAIT); since progress is saved continuously, you can interrupt and resume at any time.
+
 ## Daemon (Optional)
 
 The `daemon` command is **optional** and only needed for real-time message capture.
@@ -114,9 +163,14 @@ tgcli daemon --no-backfill
 
 # Ignore specific chats or all channels
 tgcli daemon --ignore 123456789 --ignore-channels
+
+# Skip the startup catch-up sync (fork feature, see below)
+tgcli daemon --no-startup-catchup
 ```
 
-The daemon maintains a persistent connection to Telegram and stores messages instantly as they arrive. By default, it also runs a background incremental sync to catch any messages that arrived while offline.
+The daemon maintains a persistent connection to Telegram and stores messages instantly as they arrive.
+
+**Startup catch-up** *(fork)*: on every (re)start, the daemon first runs a one-shot incremental sync of chats active within the last 30 days, recovering messages missed while it was down (reboot, crash, reconnect). It runs sequentially before the live stream starts, so it never contends with the live writer for the DB lock. Disable with `--no-startup-catchup`.
 
 ## Architecture
 

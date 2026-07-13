@@ -2359,22 +2359,50 @@ fn extract_chat_from_updates(updates: &tl::enums::Updates) -> Result<JoinChatRes
 }
 
 /// Get filename and extension for media
+/// Reduce a peer-supplied media filename to a safe basename usable as a single
+/// path component, or `None` if nothing usable remains.
+///
+/// The sender fully controls the document's filename attribute, so a raw value
+/// like `../../.zshrc` or `/etc/cron.d/x` must never reach `Path::join` /
+/// `File::create` unsanitized — it would let a peer direct the write outside the
+/// chosen download directory (arbitrary file overwrite → code execution).
+fn sanitize_filename(name: &str) -> Option<String> {
+    // Keep only the final path component; this drops any directory prefix and
+    // any `..` segments.
+    let base = std::path::Path::new(name).file_name()?.to_str()?;
+    // Strip path separators that survive on the current platform (e.g. a
+    // backslash is not a separator on Unix) and any control bytes (incl. NUL).
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\') && !c.is_control())
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 fn get_media_filename(media: &grammers_client::types::Media, msg_id: i64) -> (String, String) {
     use grammers_client::types::Media;
 
     match media {
         Media::Photo(_) => (format!("photo_{}", msg_id), "jpg".to_string()),
         Media::Document(doc) => {
-            // Try to get original filename
-            if !doc.name().is_empty() {
-                let name = doc.name();
-                if let Some(pos) = name.rfind('.') {
-                    return (name[..pos].to_string(), name[pos + 1..].to_string());
+            // The filename is chosen by the sender; confine it to a safe
+            // basename before it is used to build the output path.
+            if let Some(safe) = sanitize_filename(doc.name()) {
+                if let Some(pos) = safe.rfind('.') {
+                    // Require a non-empty stem and extension, otherwise fall
+                    // through to the ".bin" form (e.g. a leading-dot name).
+                    if pos > 0 && pos < safe.len() - 1 {
+                        return (safe[..pos].to_string(), safe[pos + 1..].to_string());
+                    }
                 }
-                return (name.to_string(), "bin".to_string());
+                return (safe, "bin".to_string());
             }
 
-            // Determine extension from mime type
+            // No usable original name — synthesize one from the message id.
             let ext = doc
                 .mime_type()
                 .map(media_mime_to_ext)
@@ -2478,5 +2506,53 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn strips_directory_traversal() {
+        // Relative traversal collapses to the basename.
+        assert_eq!(sanitize_filename("../../.zshrc").as_deref(), Some(".zshrc"));
+        assert_eq!(
+            sanitize_filename("../../../etc/cron.d/evil").as_deref(),
+            Some("evil")
+        );
+    }
+
+    #[test]
+    fn strips_absolute_paths() {
+        assert_eq!(
+            sanitize_filename("/Users/victim/.ssh/authorized_keys").as_deref(),
+            Some("authorized_keys")
+        );
+        assert_eq!(sanitize_filename("/etc/passwd").as_deref(), Some("passwd"));
+    }
+
+    #[test]
+    fn rejects_pure_traversal_and_empty() {
+        assert_eq!(sanitize_filename(".."), None);
+        assert_eq!(sanitize_filename("."), None);
+        assert_eq!(sanitize_filename(""), None);
+        assert_eq!(sanitize_filename("/"), None);
+    }
+
+    #[test]
+    fn drops_separators_and_control_bytes() {
+        // A NUL or embedded separator can never survive into the basename.
+        assert_eq!(sanitize_filename("a\\b\\c.txt").as_deref(), Some("abc.txt"));
+        assert_eq!(sanitize_filename("evil\0.sh").as_deref(), Some("evil.sh"));
+    }
+
+    #[test]
+    fn preserves_ordinary_names() {
+        assert_eq!(sanitize_filename("report.pdf").as_deref(), Some("report.pdf"));
+        assert_eq!(
+            sanitize_filename("archive.tar.gz").as_deref(),
+            Some("archive.tar.gz")
+        );
     }
 }

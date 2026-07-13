@@ -881,11 +881,16 @@ impl App {
         offset_id: Option<i64>,
         limit: usize,
     ) -> Result<usize> {
-        self.backfill_messages_with_progress(chat_id, topic_id, offset_id, limit, false)
+        self.backfill_messages_with_progress(chat_id, topic_id, offset_id, limit, false, false, false)
             .await
     }
 
     /// Backfill messages with optional progress output.
+    ///
+    /// When `all` is true, `limit` is ignored and the walk continues backward
+    /// until the start of the chat is reached (or the process is cancelled).
+    /// When `download_media` is true, media files are downloaded and their
+    /// local paths recorded, mirroring `sync --download-media`.
     pub async fn backfill_messages_with_progress(
         &self,
         chat_id: i64,
@@ -893,6 +898,8 @@ impl App {
         offset_id: Option<i64>,
         limit: usize,
         show_progress: bool,
+        all: bool,
+        download_media: bool,
     ) -> Result<usize> {
         let peer_ref = self.resolve_peer_ref(chat_id).await?;
 
@@ -907,17 +914,29 @@ impl App {
             message_iter = message_iter.offset_id(oid as i32);
         }
 
+        // Cancellation: allow Ctrl-C to stop a long full-history walk cleanly.
+        // Every message is upserted immediately, so stopping loses nothing and
+        // re-running resumes from the new oldest message.
+        let cancellation_token = crate::shutdown::global().child_token();
+
         // Progress tracking
         let progress_interval = std::time::Duration::from_millis(500);
         let mut last_progress_time = std::time::Instant::now();
 
         if show_progress {
-            eprint!("\rFetching... 0/{} messages", limit);
+            if all {
+                eprint!("\rFetching... 0 messages");
+            } else {
+                eprint!("\rFetching... 0/{} messages", limit);
+            }
         }
 
         let mut count = 0;
         while let Some(msg) = message_iter.next().await? {
-            if count >= limit {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+            if !all && count >= limit {
                 break;
             }
 
@@ -936,7 +955,19 @@ impl App {
             let from_me = msg.outgoing();
             let text = msg.text().to_string();
             let reply_to_id = msg.reply_to_message_id().map(|id| id as i64);
-            let media_type = msg.media().map(|_| "media".to_string());
+
+            let (media_type, media_path) = if download_media {
+                crate::app::sync::download_message_media_static(
+                    &self.tg.client,
+                    &msg,
+                    chat_id,
+                    &self.store_dir,
+                )
+                .await
+                .unwrap_or_else(|_| (msg.media().map(|_| "media".to_string()), None))
+            } else {
+                (msg.media().map(|_| "media".to_string()), None)
+            };
 
             self.get_store()
                 .await?
@@ -949,7 +980,7 @@ impl App {
                     from_me,
                     text,
                     media_type,
-                    media_path: None,
+                    media_path,
                     reply_to_id,
                     topic_id: msg_topic_id,
                 })
@@ -958,7 +989,11 @@ impl App {
 
             // Show progress periodically
             if show_progress && last_progress_time.elapsed() >= progress_interval {
-                eprint!("\rFetching... {}/{} messages", count, limit);
+                if all {
+                    eprint!("\rFetching... {} messages", count);
+                } else {
+                    eprint!("\rFetching... {}/{} messages", count, limit);
+                }
                 last_progress_time = std::time::Instant::now();
             }
         }

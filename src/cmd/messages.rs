@@ -15,15 +15,21 @@ pub enum ExportFormat {
 pub enum MessagesCommand {
     /// Fetch older messages from Telegram (backfill history)
     Fetch {
-        /// Chat ID (required)
-        #[arg(long)]
-        chat: i64,
+        /// Chat ID (repeatable — pass --chat multiple times to backfill several chats)
+        #[arg(long, required = true, value_name = "CHAT_ID")]
+        chat: Vec<i64>,
         /// Topic ID (for forum groups)
         #[arg(long)]
         topic: Option<i32>,
-        /// Number of messages to fetch
+        /// Number of messages to fetch (ignored when --all is set)
         #[arg(long, default_value = "100")]
         limit: usize,
+        /// Fetch the entire history: walk back until the start of each chat
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Download media files while backfilling
+        #[arg(long, default_value_t = false)]
+        download_media: bool,
         /// Suppress progress output
         #[arg(long, default_value_t = false)]
         no_progress: bool,
@@ -250,39 +256,73 @@ pub async fn run(cli: &Cli, cmd: &MessagesCommand) -> Result<()> {
             chat,
             topic,
             limit,
+            all,
+            download_media,
             no_progress,
         } => {
-            // Get oldest message ID we have for this chat
-            let oldest_id = store.get_oldest_message_id(*chat, *topic).await?;
-
             // Requires network access
             let app = App::new(cli).await?;
 
-            let fetched = app
-                .backfill_messages_with_progress(*chat, *topic, oldest_id, *limit, !*no_progress)
-                .await?;
+            let mut per_chat = Vec::new();
+            let mut total_fetched = 0usize;
+
+            for chat_id in chat {
+                // Get oldest message ID we have for this chat — the backfill walks
+                // backward from here, so it resumes wherever a prior run left off.
+                let oldest_id = store.get_oldest_message_id(*chat_id, *topic).await?;
+
+                let fetched = app
+                    .backfill_messages_with_progress(
+                        *chat_id,
+                        *topic,
+                        oldest_id,
+                        *limit,
+                        !*no_progress,
+                        *all,
+                        *download_media,
+                    )
+                    .await?;
+
+                total_fetched += fetched;
+                per_chat.push((*chat_id, oldest_id, fetched));
+            }
 
             if cli.output.is_json() {
                 out::write_json(&serde_json::json!({
-                    "chat_id": chat,
                     "topic_id": topic,
-                    "offset_id": oldest_id,
-                    "fetched": fetched,
+                    "total_fetched": total_fetched,
+                    "chats": per_chat
+                        .iter()
+                        .map(|(chat_id, oldest_id, fetched)| serde_json::json!({
+                            "chat_id": chat_id,
+                            "offset_id": oldest_id,
+                            "fetched": fetched,
+                        }))
+                        .collect::<Vec<_>>(),
                 }))?;
             } else {
-                if let Some(oid) = oldest_id {
-                    println!(
-                        "Fetched {} messages older than ID {} from chat {}",
-                        fetched, oid, chat
-                    );
-                } else {
-                    println!(
-                        "Fetched {} messages from chat {} (no prior messages)",
-                        fetched, chat
-                    );
+                for (chat_id, oldest_id, fetched) in &per_chat {
+                    if let Some(oid) = oldest_id {
+                        println!(
+                            "Fetched {} messages older than ID {} from chat {}",
+                            fetched, oid, chat_id
+                        );
+                    } else {
+                        println!(
+                            "Fetched {} messages from chat {} (no prior messages)",
+                            fetched, chat_id
+                        );
+                    }
                 }
                 if let Some(tid) = topic {
                     println!("  (topic: {})", tid);
+                }
+                if per_chat.len() > 1 {
+                    println!(
+                        "Total: {} messages across {} chats",
+                        total_fetched,
+                        per_chat.len()
+                    );
                 }
             }
         }

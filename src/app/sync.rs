@@ -2201,7 +2201,7 @@ fn resolve_peer_from_session_static(
 }
 
 /// Static version of download_message_media for use in async tasks
-async fn download_message_media_static(
+pub(crate) async fn download_message_media_static(
     client: &Client,
     msg: &TgMessage,
     chat_id: i64,

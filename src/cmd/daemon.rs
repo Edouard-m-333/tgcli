@@ -7,21 +7,28 @@
 
 use crate::app::App;
 use crate::shutdown;
-use crate::store::UpsertMessageParams;
+use crate::store::{Store, UpsertMessageParams};
 use crate::Cli;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Args;
 use grammers_client::types::Peer;
 use grammers_client::{Update, UpdatesConfiguration};
+use grammers_session::defs::{PeerId, PeerKind};
 use grammers_tl_types as tl;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
 
 /// The startup catch-up only re-syncs chats active within this many days, so it
 /// polls a few hundred chats at most instead of every chat (avoids FLOOD_WAIT).
 const STARTUP_CATCHUP_DAYS: i64 = 30;
+
+/// Reconcile dialog metadata and recent history every three hours. Live
+/// updates remain the fast path; this overlap is the durable repair path.
+const DEFAULT_RECONCILE_INTERVAL_SECONDS: u64 = 3 * 60 * 60;
 
 #[derive(Args, Debug, Clone)]
 pub struct DaemonArgs {
@@ -53,16 +60,61 @@ pub struct DaemonArgs {
     /// (which recovers messages missed while the daemon was down).
     #[arg(long, default_value_t = false)]
     pub no_startup_catchup: bool,
-}
 
-/// Extract chat_id from a Peer
-fn extract_chat_id_from_peer(peer: &Peer) -> i64 {
-    peer.id().bare_id()
+    /// Periodically refresh dialogs and reconcile recent history. Set to 0 to
+    /// disable. This remains active when --no-backfill disables the older
+    /// concurrent background sync.
+    #[arg(long, default_value_t = DEFAULT_RECONCILE_INTERVAL_SECONDS)]
+    pub reconcile_interval_seconds: u64,
 }
 
 /// Extract sender_id from a Message update
 fn extract_sender_id(msg: &grammers_client::types::update::Message) -> i64 {
-    msg.sender().map(|s| s.id().bare_id()).unwrap_or(0)
+    if let Some(sender) = msg.sender() {
+        return sender.id().bare_id();
+    }
+
+    let raw_sender = match message_from_raw_update(&msg.raw) {
+        Some(tl::enums::Message::Message(message)) => message.from_id.as_ref(),
+        Some(tl::enums::Message::Service(message)) => message.from_id.as_ref(),
+        Some(tl::enums::Message::Empty(_)) | None => None,
+    };
+    if let Some(sender) = raw_sender {
+        return bare_id_from_raw_peer(sender);
+    }
+
+    let peer_id = msg.peer_id();
+    if !msg.outgoing() && matches!(peer_id.kind(), PeerKind::User | PeerKind::UserSelf) {
+        return peer_id.bare_id();
+    }
+
+    0
+}
+
+fn message_from_raw_update(raw: &tl::enums::Update) -> Option<&tl::enums::Message> {
+    match raw {
+        tl::enums::Update::NewMessage(update) => Some(&update.message),
+        tl::enums::Update::NewChannelMessage(update) => Some(&update.message),
+        tl::enums::Update::EditMessage(update) => Some(&update.message),
+        tl::enums::Update::EditChannelMessage(update) => Some(&update.message),
+        _ => None,
+    }
+}
+
+fn bare_id_from_raw_peer(peer: &tl::enums::Peer) -> i64 {
+    match peer {
+        tl::enums::Peer::User(user) => user.user_id,
+        tl::enums::Peer::Chat(chat) => chat.chat_id,
+        tl::enums::Peer::Channel(channel) => channel.channel_id,
+    }
+}
+
+fn chat_kind_from_peer_id(peer_id: PeerId) -> &'static str {
+    match peer_id.kind() {
+        PeerKind::User | PeerKind::UserSelf => "user",
+        PeerKind::Chat => "group",
+        PeerKind::Channel => "channel",
+    }
 }
 
 /// Extract topic_id from a raw update if present
@@ -127,7 +179,13 @@ fn username_from_peer(peer: &Peer) -> Option<String> {
 
 /// Check if Peer is a forum
 fn is_forum_peer(peer: &Peer) -> bool {
-    matches!(peer, Peer::Channel(c) if c.raw.forum)
+    match peer {
+        Peer::Group(group) => {
+            matches!(&group.raw, tl::enums::Chat::Channel(channel) if channel.forum)
+        }
+        Peer::Channel(channel) => channel.raw.forum,
+        Peer::User(_) => false,
+    }
 }
 
 /// Get access_hash from Peer
@@ -141,8 +199,188 @@ fn access_hash_from_peer(peer: &Peer) -> Option<i64> {
             }
         }
         Peer::Channel(c) => c.raw.access_hash,
-        Peer::Group(_) => None, // Basic groups don't have access_hash
+        Peer::Group(group) => match &group.raw {
+            tl::enums::Chat::Channel(channel) => channel.access_hash,
+            tl::enums::Chat::ChannelForbidden(channel) => Some(channel.access_hash),
+            // Basic groups don't use access hashes.
+            _ => None,
+        },
     }
+}
+
+async fn enrich_message_peer(
+    store: &Store,
+    msg: &grammers_client::types::update::Message,
+    peer: &Peer,
+    chat_id: i64,
+    ts: chrono::DateTime<Utc>,
+    archived: bool,
+) -> Result<()> {
+    if let Some(Peer::User(user)) = msg.sender() {
+        store
+            .upsert_contact(
+                user.bare_id(),
+                user.username(),
+                user.first_name().unwrap_or(""),
+                user.last_name().unwrap_or(""),
+                user.phone().unwrap_or(""),
+            )
+            .await?;
+    }
+
+    store
+        .upsert_chat(
+            chat_id,
+            chat_kind_from_peer(peer),
+            &chat_name_from_peer(peer),
+            username_from_peer(peer).as_deref(),
+            Some(ts),
+            is_forum_peer(peer),
+            access_hash_from_peer(peer),
+            archived,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn persist_message_update(
+    app: &App,
+    args: &DaemonArgs,
+    ignore_set: &HashSet<i64>,
+    msg: grammers_client::types::update::Message,
+    is_edit: bool,
+    messages_stored: &AtomicU64,
+) -> Result<()> {
+    let peer_id = msg.peer_id();
+    let chat_id = peer_id.bare_id();
+    let peer = msg.peer().ok().cloned();
+    let store = app.get_store().await?;
+    let existing_chat = store.get_chat(chat_id).await?;
+    let chat_kind = peer
+        .as_ref()
+        .map(|value| chat_kind_from_peer(value).to_string())
+        .or_else(|| existing_chat.as_ref().map(|chat| chat.kind.clone()))
+        .unwrap_or_else(|| chat_kind_from_peer_id(peer_id).to_string());
+
+    if ignore_set.contains(&chat_id) || (args.ignore_channels && chat_kind == "channel") {
+        return Ok(());
+    }
+
+    let sender_id = extract_sender_id(&msg);
+    let from_me = msg.outgoing();
+    let text = msg.text().to_string();
+    let ts = msg.date();
+    let edit_ts = is_edit.then(Utc::now);
+    let reply_to_id = msg.reply_to_message_id().map(|id| id as i64);
+    let topic_id = extract_topic_id_from_raw(&msg.raw);
+    let media_type = msg.media().map(|_| "media".to_string());
+
+    store
+        .persist_live_message(
+            UpsertMessageParams {
+                id: msg.id() as i64,
+                chat_id,
+                sender_id,
+                ts,
+                edit_ts,
+                from_me,
+                text: text.clone(),
+                media_type: media_type.clone(),
+                media_path: None,
+                reply_to_id,
+                topic_id,
+            },
+            &chat_kind,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to durably persist {} message {} in chat {}",
+                if is_edit { "edited" } else { "new" },
+                msg.id(),
+                chat_id
+            )
+        })?;
+    messages_stored.fetch_add(1, Ordering::Relaxed);
+
+    // Emit only after the durable write succeeds.
+    if args.stream {
+        use std::io::Write;
+        let obj = serde_json::json!({
+            "type": if is_edit { "message_edited" } else { "new_message" },
+            "chat_id": chat_id,
+            "id": msg.id(),
+            "sender_id": sender_id,
+            "from_me": from_me,
+            "ts": ts.to_rfc3339(),
+            "edit_ts": edit_ts.map(|value| value.to_rfc3339()),
+            "text": text,
+            "topic_id": topic_id,
+            "media_type": media_type,
+        });
+        println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+        let _ = std::io::stdout().flush();
+    }
+
+    if let Some(peer) = peer.as_ref() {
+        let archived = existing_chat.map(|chat| chat.archived).unwrap_or(false);
+        if let Err(error) = enrich_message_peer(&store, &msg, peer, chat_id, ts, archived).await {
+            // The message is already durable and the resolution marker remains
+            // queued, so metadata failure is retryable rather than lossy.
+            log::warn!(
+                "Message {} in chat {} persisted; peer enrichment queued after error: {}",
+                msg.id(),
+                chat_id,
+                error
+            );
+        }
+    } else {
+        log::warn!(
+            "Message {} in chat {} persisted using raw peer ID; peer enrichment queued",
+            msg.id(),
+            chat_id
+        );
+    }
+
+    Ok(())
+}
+
+async fn reconcile_recent_history(app: &mut App, args: &DaemonArgs, phase: &str) -> Result<()> {
+    let (dialogs_refreshed, pending_peers) = app
+        .refresh_active_dialogs(&args.ignore_chat_ids, args.ignore_channels)
+        .await?;
+    let opts = crate::app::sync::SyncOptions {
+        output: crate::app::sync::OutputMode::None,
+        mark_read: false,
+        download_media: false,
+        ignore_chat_ids: args.ignore_chat_ids.clone(),
+        ignore_channels: args.ignore_channels,
+        show_progress: false,
+        incremental: true,
+        messages_per_chat: 50,
+        concurrency: 4,
+        chat_filter: None,
+        prune_after: None,
+        skip_archived: false,
+        archived_only: false,
+        active_since: Some(Utc::now() - chrono::Duration::days(STARTUP_CATCHUP_DAYS)),
+    };
+    let result = app.sync_msgs(opts).await?;
+    log::info!(
+        "{} reconciliation: {} dialogs / {} msgs / {} chats / {} peers pending",
+        phase,
+        dialogs_refreshed,
+        result.messages_stored,
+        result.chats_stored,
+        pending_peers
+    );
+    if !args.quiet {
+        eprintln!(
+            "{} reconciliation complete: {} new messages across {} chats ({} peers pending)",
+            phase, result.messages_stored, result.chats_stored, pending_peers
+        );
+    }
+    Ok(())
 }
 
 pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
@@ -157,38 +395,8 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         if !args.quiet {
             eprintln!("Startup catch-up sync...");
         }
-        let opts = crate::app::sync::SyncOptions {
-            output: crate::app::sync::OutputMode::None,
-            mark_read: false,
-            download_media: false,
-            ignore_chat_ids: args.ignore_chat_ids.clone(),
-            ignore_channels: args.ignore_channels,
-            show_progress: false,
-            incremental: true,
-            messages_per_chat: 50,
-            concurrency: 4,
-            chat_filter: None,
-            prune_after: None,
-            skip_archived: false,
-            archived_only: false,
-            // Only re-sync recently-active chats — polling every chat triggers
-            // FLOOD_WAIT and is wasteful (a gap matters for active chats).
-            active_since: Some(Utc::now() - chrono::Duration::days(STARTUP_CATCHUP_DAYS)),
-        };
-        match app.sync_msgs(opts).await {
-            Ok(res) => {
-                log::info!(
-                    "startup catch-up: {} msgs / {} chats",
-                    res.messages_stored,
-                    res.chats_stored
-                );
-                if !args.quiet {
-                    eprintln!(
-                        "Startup catch-up complete: {} new messages across {} chats",
-                        res.messages_stored, res.chats_stored
-                    );
-                }
-            }
+        match reconcile_recent_history(&mut app, args, "Startup").await {
+            Ok(()) => {}
             Err(e) => {
                 // Never fatal — fall through to live listening regardless.
                 log::warn!("startup catch-up failed (continuing to live listen): {}", e);
@@ -206,7 +414,6 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         .context("Updates receiver not available")?;
 
     let ignore_set: HashSet<i64> = args.ignore_chat_ids.iter().copied().collect();
-    let ignore_channels = args.ignore_channels;
 
     // Get global shutdown controller
     let shutdown_ctrl = shutdown::global();
@@ -229,7 +436,10 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     let mut update_stream = app.tg.client.stream_updates(
         updates_rx,
         UpdatesConfiguration {
-            catch_up: !args.no_backfill, // Catch up on missed updates if backfill enabled
+            // Update-state catch-up is independent from the optional concurrent
+            // history backfill. Keeping it enabled closes MTProto update gaps;
+            // idempotent SQLite upserts absorb duplicates.
+            catch_up: true,
             ..Default::default()
         },
     );
@@ -314,6 +524,13 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         eprintln!("Daemon ready. Press Ctrl+C to stop.");
     }
 
+    let reconciliation_enabled = args.reconcile_interval_seconds > 0;
+    let mut reconciliation_interval =
+        tokio::time::interval(Duration::from_secs(args.reconcile_interval_seconds.max(1)));
+    reconciliation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The startup reconciliation above already covers the immediate tick.
+    reconciliation_interval.tick().await;
+
     // Main update loop
     loop {
         tokio::select! {
@@ -323,6 +540,17 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
                 }
                 break;
             }
+            _ = reconciliation_interval.tick(), if reconciliation_enabled && !backfill_running.load(Ordering::Relaxed) => {
+                if !args.quiet {
+                    eprintln!("Periodic reconciliation sync...");
+                }
+                if let Err(e) = reconcile_recent_history(&mut app, args, "Periodic").await {
+                    log::warn!("periodic reconciliation failed (will retry): {}", e);
+                    if !args.quiet {
+                        eprintln!("Periodic reconciliation failed (will retry): {}", e);
+                    }
+                }
+            }
             update_result = update_stream.next() => {
                 match update_result {
                     Ok(update) => {
@@ -330,163 +558,26 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
 
                         match update {
                             Update::NewMessage(msg) => {
-                                // Get the peer (chat) from the message
-                                let peer = match msg.peer() {
-                                    Ok(p) => p.clone(),
-                                    Err(_) => {
-                                        log::warn!("Could not resolve peer for message {}", msg.id());
-                                        continue;
-                                    }
-                                };
-
-                                let chat_id = extract_chat_id_from_peer(&peer);
-                                let chat_kind = chat_kind_from_peer(&peer);
-
-                                // Check ignore filters
-                                if ignore_set.contains(&chat_id) {
-                                    continue;
-                                }
-                                if ignore_channels && chat_kind == "channel" {
-                                    continue;
-                                }
-
-                                let sender_id = extract_sender_id(&msg);
-                                let from_me = msg.outgoing();
-                                let text = msg.text().to_string();
-                                let ts = msg.date();
-                                let reply_to_id = msg.reply_to_message_id().map(|id| id as i64);
-                                let topic_id = extract_topic_id_from_raw(&msg.raw);
-                                let media_type = msg.media().map(|_| "media".to_string());
-
-                                // Stream output if enabled
-                                if args.stream {
-                                    use std::io::Write;
-                                    let obj = serde_json::json!({
-                                        "type": "new_message",
-                                        "chat_id": chat_id,
-                                        "id": msg.id(),
-                                        "sender_id": sender_id,
-                                        "from_me": from_me,
-                                        "ts": ts.to_rfc3339(),
-                                        "text": text,
-                                        "topic_id": topic_id,
-                                        "media_type": media_type,
-                                    });
-                                    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
-                                    let _ = std::io::stdout().flush();
-                                }
-
-                                // Store message directly - get fresh store for each operation
-                                if let Err(e) = app.get_store().await?.upsert_message(UpsertMessageParams {
-                                    id: msg.id() as i64,
-                                    chat_id,
-                                    sender_id,
-                                    ts,
-                                    edit_ts: None,
-                                    from_me,
-                                    text,
-                                    media_type,
-                                    media_path: None, // TODO: download media if enabled
-                                    reply_to_id,
-                                    topic_id,
-                                }).await {
-                                    log::error!("Failed to store message: {}", e);
-                                } else {
-                                    messages_stored.fetch_add(1, Ordering::Relaxed);
-                                }
-
-                                // Populate contacts from the sender in real time so
-                                // names resolve. Costs nothing — the sender object
-                                // already arrived with the update.
-                                if let Some(Peer::User(user)) = msg.sender() {
-                                    if let Err(e) = app
-                                        .get_store()
-                                        .await?
-                                        .upsert_contact(
-                                            user.bare_id(),
-                                            user.username(),
-                                            user.first_name().unwrap_or(""),
-                                            user.last_name().unwrap_or(""),
-                                            user.phone().unwrap_or(""),
-                                        )
-                                        .await
-                                    {
-                                        log::warn!("Failed to upsert sender contact: {}", e);
-                                    }
-                                }
-
-                                // Update chat metadata
-                                let chat_name = chat_name_from_peer(&peer);
-                                let username = username_from_peer(&peer);
-                                let is_forum = is_forum_peer(&peer);
-                                let access_hash = access_hash_from_peer(&peer);
-
-                                // Check existing chat's archived status, default to false for new chats
-                                let archived = app
-                                    .get_store()
-                                    .await?
-                                    .get_chat(chat_id)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .map(|c| c.archived)
-                                    .unwrap_or(false);
-
-                                if let Err(e) = app.get_store().await?.upsert_chat(
-                                    chat_id,
-                                    chat_kind,
-                                    &chat_name,
-                                    username.as_deref(),
-                                    Some(ts),
-                                    is_forum,
-                                    access_hash,
-                                    archived,
-                                ).await {
-                                    log::error!("Failed to update chat metadata: {}", e);
-                                }
-
-                                // Update last sync message ID
-                                if let Err(e) = app.get_store().await?.update_last_sync_message_id(chat_id, msg.id() as i64).await {
-                                    log::error!("Failed to update last_sync_message_id: {}", e);
-                                }
+                                persist_message_update(
+                                    &app,
+                                    args,
+                                    &ignore_set,
+                                    msg,
+                                    false,
+                                    messages_stored.as_ref(),
+                                )
+                                .await?;
                             }
                             Update::MessageEdited(msg) => {
-                                // Get the peer (chat) from the message
-                                let peer = match msg.peer() {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        log::warn!("Could not resolve peer for edited message {}", msg.id());
-                                        continue;
-                                    }
-                                };
-
-                                let chat_id = extract_chat_id_from_peer(peer);
-
-                                // Check ignore filters
-                                if ignore_set.contains(&chat_id) {
-                                    continue;
-                                }
-
-                                let text = msg.text().to_string();
-
-                                // Stream output if enabled
-                                if args.stream {
-                                    use std::io::Write;
-                                    let obj = serde_json::json!({
-                                        "type": "message_edited",
-                                        "chat_id": chat_id,
-                                        "id": msg.id(),
-                                        "text": text,
-                                        "edit_ts": Utc::now().to_rfc3339(),
-                                    });
-                                    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
-                                    let _ = std::io::stdout().flush();
-                                }
-
-                                // Update message text - get fresh store for each operation
-                                if let Err(e) = app.get_store().await?.update_message_text(chat_id, msg.id() as i64, &text).await {
-                                    log::error!("Failed to update edited message: {}", e);
-                                }
+                                persist_message_update(
+                                    &app,
+                                    args,
+                                    &ignore_set,
+                                    msg,
+                                    true,
+                                    messages_stored.as_ref(),
+                                )
+                                .await?;
                             }
                             Update::MessageDeleted(deletion) => {
                                 // Extract deleted message IDs from raw update
@@ -562,4 +653,34 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_raw_peer_ids_without_resolving_metadata() {
+        assert_eq!(chat_kind_from_peer_id(PeerId::user(42)), "user");
+        assert_eq!(chat_kind_from_peer_id(PeerId::chat(42)), "group");
+        assert_eq!(chat_kind_from_peer_id(PeerId::channel(42)), "channel");
+    }
+
+    #[test]
+    fn extracts_bare_ids_from_raw_peers() {
+        assert_eq!(
+            bare_id_from_raw_peer(&tl::enums::Peer::User(tl::types::PeerUser { user_id: 11 })),
+            11
+        );
+        assert_eq!(
+            bare_id_from_raw_peer(&tl::enums::Peer::Chat(tl::types::PeerChat { chat_id: 22 })),
+            22
+        );
+        assert_eq!(
+            bare_id_from_raw_peer(&tl::enums::Peer::Channel(tl::types::PeerChannel {
+                channel_id: 33,
+            })),
+            33
+        );
+    }
 }

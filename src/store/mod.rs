@@ -99,6 +99,20 @@ pub struct UpsertMessageParams {
     pub topic_id: Option<i32>,
 }
 
+const UPSERT_MESSAGE_SQL: &str =
+    "INSERT INTO messages (id, chat_id, sender_id, ts, edit_ts, from_me, text, media_type, media_path, reply_to_id, topic_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT(chat_id, id) DO UPDATE SET
+        sender_id = excluded.sender_id,
+        ts = excluded.ts,
+        edit_ts = COALESCE(excluded.edit_ts, edit_ts),
+        from_me = excluded.from_me,
+        text = CASE WHEN excluded.text != '' THEN excluded.text ELSE text END,
+        media_type = COALESCE(excluded.media_type, media_type),
+        media_path = COALESCE(excluded.media_path, media_path),
+        reply_to_id = COALESCE(excluded.reply_to_id, reply_to_id),
+        topic_id = COALESCE(excluded.topic_id, topic_id)";
+
 impl Store {
     pub async fn open(store_dir: &str) -> Result<Self> {
         std::fs::create_dir_all(store_dir)?;
@@ -209,6 +223,24 @@ impl Store {
         .await
         .context("Failed to create topics table")?;
 
+        // A message can contain a stable peer ID even when grammers cannot
+        // resolve the full peer metadata attached to an update. Persist the
+        // message first, and keep the peer here until a dialog refresh resolves
+        // its name, type, username and access hash.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS peer_resolution_queue (
+                chat_id INTEGER PRIMARY KEY,
+                peer_kind TEXT NOT NULL,
+                first_seen_ts TEXT NOT NULL,
+                last_seen_ts TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_ts TEXT
+            )",
+            (),
+        )
+        .await
+        .context("Failed to create peer resolution queue")?;
+
         // Add media_path column if it doesn't exist (migration for existing DBs)
         let _ = conn
             .execute("ALTER TABLE messages ADD COLUMN media_path TEXT", ())
@@ -273,6 +305,11 @@ impl Store {
         .await?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_peer_resolution_last_seen ON peer_resolution_queue(last_seen_ts)",
             (),
         )
         .await?;
@@ -407,6 +444,101 @@ impl Store {
             (id, kind, name, username, ts_str.as_deref(), is_forum_int, access_hash, archived_int),
         )
         .await?;
+        conn.execute("DELETE FROM peer_resolution_queue WHERE chat_id = ?1", [id])
+            .await?;
+        Ok(())
+    }
+
+    /// Persist a live message before attempting peer metadata enrichment.
+    ///
+    /// The placeholder chat, reconciliation checkpoint, message and durable
+    /// peer-resolution marker are committed atomically. Existing checkpoints
+    /// are deliberately not advanced by live delivery, so a later history
+    /// reconciliation can still detect and repair gaps.
+    pub async fn persist_live_message(
+        &self,
+        p: UpsertMessageParams,
+        inferred_chat_kind: &str,
+    ) -> Result<()> {
+        let ts_str = p.ts.to_rfc3339();
+        let observed_at = Utc::now().to_rfc3339();
+        let edit_ts_str = p.edit_ts.map(|t| t.to_rfc3339());
+        let from_me_int = p.from_me as i64;
+        let initial_checkpoint = p.id.saturating_sub(1).max(0);
+
+        let mut conn = self.get_conn().await?;
+        let tx = conn.transaction().await?;
+
+        tx.execute(
+            "INSERT INTO chats (id, kind, name, last_message_ts, last_sync_message_id)
+             VALUES (?1, ?2, '', ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = CASE WHEN chats.name = '' THEN excluded.kind ELSE chats.kind END,
+                last_message_ts = CASE WHEN excluded.last_message_ts > chats.last_message_ts OR chats.last_message_ts IS NULL
+                    THEN excluded.last_message_ts ELSE chats.last_message_ts END,
+                last_sync_message_id = COALESCE(chats.last_sync_message_id, excluded.last_sync_message_id)",
+            (
+                p.chat_id,
+                inferred_chat_kind,
+                ts_str.as_str(),
+                initial_checkpoint,
+            ),
+        )
+        .await?;
+
+        tx.execute(
+            UPSERT_MESSAGE_SQL,
+            (
+                p.id,
+                p.chat_id,
+                p.sender_id,
+                ts_str.as_str(),
+                edit_ts_str.as_deref(),
+                from_me_int,
+                p.text.as_str(),
+                p.media_type.as_deref(),
+                p.media_path.as_deref(),
+                p.reply_to_id,
+                p.topic_id,
+            ),
+        )
+        .await?;
+
+        tx.execute(
+            "INSERT INTO peer_resolution_queue (chat_id, peer_kind, first_seen_ts, last_seen_ts)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                peer_kind = excluded.peer_kind,
+                last_seen_ts = excluded.last_seen_ts",
+            (p.chat_id, inferred_chat_kind, observed_at.as_str()),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn pending_peer_resolution_count(&self) -> Result<u64> {
+        let conn = self.get_conn().await?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM peer_resolution_queue", ())
+            .await?;
+        Ok(rows
+            .next()
+            .await?
+            .map(|row| row.get::<i64>(0).unwrap_or(0) as u64)
+            .unwrap_or(0))
+    }
+
+    pub async fn mark_pending_peer_resolutions_attempted(&self) -> Result<()> {
+        let attempted_at = Utc::now().to_rfc3339();
+        let conn = self.get_conn().await?;
+        conn.execute(
+            "UPDATE peer_resolution_queue
+             SET attempt_count = attempt_count + 1, last_attempt_ts = ?1",
+            [attempted_at.as_str()],
+        )
+        .await?;
         Ok(())
     }
 
@@ -471,6 +603,8 @@ impl Store {
     /// Delete a chat from local database. Returns true if a chat was deleted.
     pub async fn delete_chat(&self, id: i64) -> Result<bool> {
         let conn = self.get_conn().await?;
+        conn.execute("DELETE FROM peer_resolution_queue WHERE chat_id = ?1", [id])
+            .await?;
         let affected = conn
             .execute("DELETE FROM chats WHERE id = ?1", [id])
             .await?;
@@ -493,13 +627,15 @@ impl Store {
         }
     }
 
-    /// List all chats that have a last_sync_message_id checkpoint set.
-    pub async fn list_chats_with_checkpoint(&self) -> Result<Vec<Chat>> {
+    /// List every local chat eligible for message synchronization. Chats with
+    /// no checkpoint must be included so a dialog first discovered after
+    /// downtime receives an initial history pass.
+    pub async fn list_chats_for_message_sync(&self) -> Result<Vec<Chat>> {
         let conn = self.get_conn().await?;
         let mut rows = conn
             .query(
                 "SELECT id, kind, name, username, last_message_ts, is_forum, last_sync_message_id, access_hash, archived 
-                 FROM chats WHERE last_sync_message_id IS NOT NULL 
+                 FROM chats
                  ORDER BY last_message_ts DESC",
                 (),
             )
@@ -695,18 +831,7 @@ impl Store {
 
         let conn = self.get_conn().await?;
         conn.execute(
-            "INSERT INTO messages (id, chat_id, sender_id, ts, edit_ts, from_me, text, media_type, media_path, reply_to_id, topic_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(chat_id, id) DO UPDATE SET
-                sender_id = excluded.sender_id,
-                ts = excluded.ts,
-                edit_ts = COALESCE(excluded.edit_ts, edit_ts),
-                from_me = excluded.from_me,
-                text = CASE WHEN excluded.text != '' THEN excluded.text ELSE text END,
-                media_type = COALESCE(excluded.media_type, media_type),
-                media_path = COALESCE(excluded.media_path, media_path),
-                reply_to_id = COALESCE(excluded.reply_to_id, reply_to_id),
-                topic_id = COALESCE(excluded.topic_id, topic_id)",
+            UPSERT_MESSAGE_SQL,
             (
                 p.id,
                 p.chat_id,
@@ -1108,6 +1233,8 @@ impl Store {
 
     pub async fn clear_chats(&self) -> Result<u64> {
         let conn = self.get_conn().await?;
+        conn.execute("DELETE FROM peer_resolution_queue", ())
+            .await?;
         let affected = conn.execute("DELETE FROM chats", ()).await?;
         Ok(affected)
     }
@@ -1260,4 +1387,130 @@ fn row_to_message(row: &Row) -> Result<Message> {
         topic_id: row.get::<Option<i32>>(10).ok().flatten(),
         snippet: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_store_dir(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tgcli-{test_name}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    fn test_message(id: i64, text: &str, edit_ts: Option<DateTime<Utc>>) -> UpsertMessageParams {
+        UpsertMessageParams {
+            id,
+            chat_id: 42,
+            sender_id: 7,
+            ts: DateTime::parse_from_rfc3339("2026-08-24T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            edit_ts,
+            from_me: false,
+            text: text.to_string(),
+            media_type: None,
+            media_path: None,
+            reply_to_id: None,
+            topic_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_message_is_durable_before_peer_metadata_resolves() -> Result<()> {
+        let store_dir = temporary_store_dir("persist-first");
+        let store = Store::open(store_dir.to_str().unwrap()).await?;
+
+        store
+            .persist_live_message(test_message(101, "first", None), "channel")
+            .await?;
+
+        let chat = store.get_chat(42).await?.expect("placeholder chat");
+        assert_eq!(chat.kind, "channel");
+        assert_eq!(chat.name, "");
+        assert_eq!(chat.last_sync_message_id, Some(100));
+        assert_eq!(store.count_messages().await?, 1);
+        assert_eq!(store.pending_peer_resolution_count().await?, 1);
+
+        // Live delivery must not move the history checkpoint forward: a later
+        // reconciliation still needs to inspect the whole unverified range.
+        store
+            .persist_live_message(test_message(105, "later", None), "channel")
+            .await?;
+        assert_eq!(
+            store
+                .get_chat(42)
+                .await?
+                .expect("placeholder chat")
+                .last_sync_message_id,
+            Some(100)
+        );
+
+        let edited_at = DateTime::parse_from_rfc3339("2026-08-24T10:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .persist_live_message(
+                test_message(101, "first, edited", Some(edited_at)),
+                "channel",
+            )
+            .await?;
+        let edited = store.get_message(42, 101).await?.expect("edited message");
+        assert_eq!(edited.text, "first, edited");
+        assert_eq!(edited.edit_ts, Some(edited_at));
+
+        store
+            .upsert_chat(
+                42,
+                "channel",
+                "Resolved channel",
+                Some("resolved"),
+                None,
+                false,
+                Some(123_456),
+                false,
+            )
+            .await?;
+        assert_eq!(store.pending_peer_resolution_count().await?, 0);
+        assert_eq!(
+            store.get_chat(42).await?.expect("resolved chat").name,
+            "Resolved channel"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(store_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_sync_includes_new_chats_without_a_checkpoint() -> Result<()> {
+        let store_dir = temporary_store_dir("new-chat-sync");
+        let store = Store::open(store_dir.to_str().unwrap()).await?;
+        store
+            .upsert_chat(
+                77,
+                "user",
+                "New after downtime",
+                None,
+                None,
+                false,
+                Some(987_654),
+                false,
+            )
+            .await?;
+
+        let chats = store.list_chats_for_message_sync().await?;
+        let chat = chats
+            .iter()
+            .find(|chat| chat.id == 77)
+            .expect("new chat must receive an initial message sync");
+        assert_eq!(chat.last_sync_message_id, None);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(store_dir);
+        Ok(())
+    }
 }

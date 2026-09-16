@@ -10,7 +10,7 @@ Features added on top of upstream `dgrr/tgcli`:
 
 - **Full-history backfill** — `messages fetch --all` walks a chat back to its very first message (Ctrl-C safe, resumes where it left off). Supports `--download-media` and repeatable `--chat` to backfill several chats in one run. See [Backfill](#backfill-full-history).
 - **Contacts auto-populated from message senders** — every message processed by `sync`, the daemon, or `chats members` upserts its sender into the local contacts table. Group members outside your address book get real names instead of `user:<id>`, at no extra API cost.
-- **Daemon startup catch-up** — on (re)start the daemon runs one incremental sync of chats active in the last 30 days before entering the live loop, recovering messages missed while it was down. Opt out with `--no-startup-catchup`.
+- **Loss-resistant daemon capture** — live updates are committed using their raw peer ID before optional peer metadata is resolved. Telegram update-state catch-up is always enabled, with startup and three-hour recent-history reconciliation as repair paths.
 
 ## Quick Install
 
@@ -158,7 +158,7 @@ tgcli daemon
 # Daemon with JSONL output (for pipelines)
 tgcli daemon --stream
 
-# Skip background sync (pure real-time only)
+# Skip the optional full background sync; durable catch-up and reconciliation remain enabled
 tgcli daemon --no-backfill
 
 # Ignore specific chats or all channels
@@ -166,11 +166,14 @@ tgcli daemon --ignore 123456789 --ignore-channels
 
 # Skip the startup catch-up sync (fork feature, see below)
 tgcli daemon --no-startup-catchup
+
+# Change the periodic reconciliation interval, or disable it with 0
+tgcli daemon --reconcile-interval-seconds 10800
 ```
 
-The daemon maintains a persistent connection to Telegram and stores messages instantly as they arrive.
+The daemon maintains a persistent connection to Telegram and stores messages instantly as they arrive. A live message is committed before full chat metadata is resolved; unresolved peers remain in a durable retry queue instead of causing the message to be skipped.
 
-**Startup catch-up** *(fork)*: on every (re)start, the daemon first runs a one-shot incremental sync of chats active within the last 30 days, recovering messages missed while it was down (reboot, crash, reconnect). It runs sequentially before the live stream starts, so it never contends with the live writer for the DB lock. Disable with `--no-startup-catchup`.
+**Automatic reconciliation** *(fork)*: on every (re)start, and every three hours thereafter, the daemon refreshes peer metadata and incrementally reconciles chats active within the last 30 days. Telegram update-state catch-up also remains enabled when `--no-backfill` is used. Disable only the startup pass with `--no-startup-catchup`, or only the periodic pass with `--reconcile-interval-seconds 0`.
 
 ## Architecture
 

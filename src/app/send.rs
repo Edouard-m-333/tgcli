@@ -881,8 +881,10 @@ impl App {
         offset_id: Option<i64>,
         limit: usize,
     ) -> Result<usize> {
-        self.backfill_messages_with_progress(chat_id, topic_id, offset_id, limit, false, false, false)
-            .await
+        self.backfill_messages_with_progress(
+            chat_id, topic_id, offset_id, limit, false, false, false,
+        )
+        .await
     }
 
     /// Backfill messages with optional progress output.
@@ -891,6 +893,7 @@ impl App {
     /// until the start of the chat is reached (or the process is cancelled).
     /// When `download_media` is true, media files are downloaded and their
     /// local paths recorded, mirroring `sync --download-media`.
+    #[allow(clippy::too_many_arguments)] // Mirrors the independent backfill CLI options.
     pub async fn backfill_messages_with_progress(
         &self,
         chat_id: i64,
@@ -2549,7 +2552,10 @@ mod filename_tests {
 
     #[test]
     fn preserves_ordinary_names() {
-        assert_eq!(sanitize_filename("report.pdf").as_deref(), Some("report.pdf"));
+        assert_eq!(
+            sanitize_filename("report.pdf").as_deref(),
+            Some("report.pdf")
+        );
         assert_eq!(
             sanitize_filename("archive.tar.gz").as_deref(),
             Some("archive.tar.gz")

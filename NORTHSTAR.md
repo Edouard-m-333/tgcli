@@ -23,7 +23,7 @@ MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target aarch64-ap
 MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target x86_64-apple-darwin
 ```
 
-Publish `tgcli-darwin-arm64` and `tgcli-darwin-x64` with SHA-256 checksums from
+Publish `tgcli-northstar-darwin-arm64` and `tgcli-northstar-darwin-x64` with SHA-256 checksums from
 this exact commit. Northstar pins both hashes. Fresh-Mac Telegram authentication,
 restart, offline recovery and large-history testing remain separate release
 acceptance checks; cross-compilation does not replace an Intel-Mac pilot.

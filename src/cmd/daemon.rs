@@ -385,6 +385,8 @@ async fn reconcile_recent_history(app: &mut App, args: &DaemonArgs, phase: &str)
 
 pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     let mut app = App::new(cli).await?;
+    let mut health = crate::onboarding::Health::default();
+    crate::onboarding::probe(&app, &mut health).await?;
 
     // Catch up on messages missed while the daemon was down. Runs once, here,
     // sequentially *before* the live update stream starts — so it never
@@ -532,8 +534,20 @@ pub async fn run(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     reconciliation_interval.tick().await;
 
     // Main update loop
+    let mut health_interval = tokio::time::interval(Duration::from_secs(30));
+    health_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut history_interval = tokio::time::interval(Duration::from_secs(20));
+    history_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = health_interval.tick() => {
+                crate::onboarding::probe(&app, &mut health).await?;
+            }
+            _ = history_interval.tick() => {
+                if let Err(error) = crate::onboarding::history_page(&app).await {
+                    log::warn!("Northstar history import: {}", error);
+                }
+            }
             _ = shutdown_ctrl.cancelled() => {
                 if !args.quiet {
                     eprintln!("\nShutting down gracefully...");

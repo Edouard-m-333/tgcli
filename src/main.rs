@@ -2,6 +2,7 @@ mod app;
 mod cmd;
 mod error;
 mod fsperm;
+mod onboarding;
 mod out;
 mod shutdown;
 mod store;
